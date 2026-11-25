@@ -1,17 +1,19 @@
 # Render blueprint — deploy with "New > Blueprint" and point it at
-# this repo, or create the Web Service manually with the same values.
-# Plan: free (512 MB RAM, sleeps after ~15 min idle — the extension
-# handles the cold start; see extension-integration/api-client.js).
-# No Docker: Render's native Node runtime. FFmpeg/ffprobe come from
-# the ffmpeg-static + ffprobe-static npm packages (prebuilt binaries
-# installed by `npm ci`), and yt-dlp is downloaded by the build
-# command below (the standalone binary, no pip needed).
+# this repo. Render builds the Dockerfile below (no build/start
+# command needed — the image bakes in yt-dlp + ffmpeg and runs
+# `node src/server.js`). Plan: free (512 MB RAM, sleeps after ~15 min
+# idle — the extension handles the cold start; see
+# extension-integration/api-client.js).
+# Binaries are baked into the image: yt-dlp is the standalone binary
+# at /usr/local/bin/yt-dlp, ffmpeg/ffprobe come from apt (on PATH).
+# The ffmpeg-static / ffprobe-static npm packages remain installed
+# as a fallback for local non-Docker runs.
 services:
   - type: web
     name: youtube-downloader-api
-    runtime: node
-    buildCommand: npm ci && mkdir -p bin && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o bin/yt-dlp && chmod +x bin/yt-dlp && ./bin/yt-dlp --version
-    startCommand: node src/server.js
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     plan: free
     # Singapore is closest to India; pick the region nearest your users.
     region: singapore
@@ -19,16 +21,9 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: NODE_VERSION
-        value: 20
-      # Binaries: yt-dlp from the build step, ffmpeg/ffprobe from
-      # the static npm packages.
+      # yt-dlp is baked into the image at this path.
       - key: YTDLP_PATH
-        value: ./bin/yt-dlp
-      - key: FFMPEG_PATH
-        value: ./node_modules/ffmpeg-static/ffmpeg
-      - key: FFPROBE_PATH
-        value: ./node_modules/ffprobe-static/bin/linux/x64/ffprobe
+        value: /usr/local/bin/yt-dlp
       - key: MAX_CONCURRENT_DOWNLOADS
         value: 2
       - key: MAX_DOWNLOAD_SIZE_MB

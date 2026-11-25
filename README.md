@@ -2,7 +2,7 @@
 
 A REST API that downloads YouTube videos and audio with **yt-dlp +
 FFmpeg**, built for a Chrome extension and deployable on **Render
-Free** with its native Node runtime — **no Docker**.
+Free** as a **Docker** container.
 
 **No database. No external storage. No Redis. No ORM.**
 
@@ -39,25 +39,21 @@ npm install
 npm start          # http://localhost:3000
 ```
 
-Install `yt-dlp` separately. It is detected from the project `bin`
-folder (`bin/yt-dlp.exe` on Windows), or from your PATH; alternatively,
-set `YTDLP_PATH` to its full path. On Windows, you can install it with
-`winget install yt-dlp.yt-dlp`. FFmpeg and ffprobe use the bundled
-`ffmpeg-static` and `ffprobe-static` binaries by default; set
-`FFMPEG_PATH` and `FFPROBE_PATH` to override them (see Configuration).
-On Render those are set for you: yt-dlp is downloaded by the build
-command, and ffmpeg/ffprobe come from the `ffmpeg-static` and
-`ffprobe-static` npm packages (prebuilt binaries, installed by
-`npm ci` — no apt, no Docker).
+Needs `yt-dlp`, `ffmpeg` and `ffprobe` on your PATH — or set
+`YTDLP_PATH`, `FFMPEG_PATH` and `FFPROBE_PATH` (see Configuration).
+On Render those are baked into the Docker image: yt-dlp is the
+standalone binary at `/usr/local/bin/yt-dlp`, and ffmpeg/ffprobe
+come from apt. The `ffmpeg-static` and `ffprobe-static` npm
+packages stay installed as a fallback for local non-Docker runs.
 
 ### Render (free)
 
 1. Push this repo to GitHub.
 2. Render dashboard → **New → Blueprint** → pick the repo. `render.yaml`
-   creates the Web Service (native Node runtime, free plan, Singapore
-   region). The build installs dependencies (including the static
-   ffmpeg/ffprobe binaries) and downloads the yt-dlp standalone
-   binary; the start command is `node src/server.js`.
+   creates the Web Service (Docker runtime, free plan, Singapore
+   region). Render builds the `Dockerfile` — it installs ffmpeg,
+   downloads the yt-dlp standalone binary and runs
+   `node src/server.js`. There is no build/start command to set.
 3. Note the URL, e.g. `https://youtube-downloader-api.onrender.com`.
 
 Render sets `PORT` itself; the app binds `0.0.0.0`.
@@ -78,7 +74,7 @@ same keys in the dashboard (Environment).
 | `RATE_LIMIT_MAX` | `100` | Requests per IP per 15 min |
 | `DOWNLOAD_RATE_LIMIT_MAX` | `20` | Download starts per IP per 15 min |
 | `CORS_ORIGINS` | *(empty)* | Comma-separated web origins; `chrome-extension://` and localhost are always allowed |
-| `YTDLP_PATH` / `FFMPEG_PATH` / `FFPROBE_PATH` | `yt-dlp` / `ffmpeg` / `ffprobe` | Binary locations. On Render these are set in `render.yaml`: `./bin/yt-dlp` (downloaded by the build command) and the static binaries from the `ffmpeg-static` / `ffprobe-static` packages. |
+| `YTDLP_PATH` / `FFMPEG_PATH` / `FFPROBE_PATH` | `yt-dlp` / `ffmpeg` / `ffprobe` | Binary locations. On Render these are set in `render.yaml`: `/usr/local/bin/yt-dlp` (baked into the Docker image) and ffmpeg/ffprobe from apt (on PATH). |
 | `YTDLP_NO_CHECK_CERTIFICATES` | `false` | Only for networks that intercept TLS (corporate/sandbox proxies) |
 | `DOWNLOADS_DIR` | OS temp dir | Override the temp download root |
 
@@ -98,6 +94,23 @@ same keys in the dashboard (Environment).
    otherwise it is a remux (stream copy, no quality loss).
 4. The finished file is served from `/api/video/jobs/:jobId/download`
    until `JOB_TTL_MINUTES` passes, then deleted by the cleanup loop.
+
+## YouTube bot checks ("Sign in to confirm you're not a bot")
+
+YouTube sometimes answers requests from datacenter IPs (Render, a VPS)
+with a sign-in challenge — even for ordinary public videos. The API
+handles it automatically: every yt-dlp call first uses the default
+(web) player client for full quality, and if YouTube answers with a
+sign-in/bot error it retries once with the Android player client,
+which usually gets through without a sign-in. Videos rescued this
+way may only offer the legacy 360p combined format (YouTube's
+SABR experiment hides the higher formats from the Android client),
+so a rescued download can be 360p even when you asked for 720p.
+Only if both attempts fail does the API return the sign-in error —
+that means the video is genuinely private, age-restricted, or
+YouTube is blocking the server's IP entirely. Storyboard
+pseudo-formats (sb0/sb1/sb2) are filtered out of the info/formats
+responses.
 
 ## Testing
 
@@ -184,6 +197,8 @@ src/
 └── config/
     └── config.js
 render.yaml
+Dockerfile           # Render builds this: node:20-slim + ffmpeg + yt-dlp
+.dockerignore
 package.json
 .env.example
 test-api.sh
