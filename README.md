@@ -152,6 +152,18 @@ from the API's `/download` URL via `chrome.downloads.download`.
 - **Restarts:** Render restarts the instance on deploy and
   occasionally otherwise. Every job is lost on restart — the client
   must handle `404 JOB_NOT_FOUND` by starting a new download.
+- **Repeated lookups are cached:** `/info` and `/formats` results
+  are cached in memory for 10 minutes per video, so the second call
+  for the same video answers in milliseconds instead of running
+  yt-dlp again. The first call for a video still takes a few
+  seconds (yt-dlp has to ask YouTube), and longer when YouTube
+  answers with a bot check and the Android retry has to run.
+- **`/health` answers instantly:** the yt-dlp/ffmpeg/ffprobe
+  versions are checked by a background probe every 5 minutes, not
+  inside the request. (Checking them live made `/health` slower
+  than Render's 5-second health-check timeout on a cold instance,
+  which restarted the service in a loop.) While the first probe is
+  still running, `/health` reports `starting` with HTTP 200.
 
 ## Security
 
