@@ -101,11 +101,11 @@ function friendlyError(stderr, code) {
   return `yt-dlp failed (exit ${code}).`;
 }
 
-async function getVersion() {
+async function getVersion(timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const child = spawn(config.ytdlpPath, ['--version'], { shell: false, windowsHide: true });
     let out = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('yt-dlp --version timed out')); }, 15000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('yt-dlp --version timed out')); }, timeoutMs);
     child.stdout.on('data', d => { out += d; });
     child.on('error', e => { clearTimeout(timer); reject(e); });
     child.on('close', code => {
@@ -143,17 +143,65 @@ function mapFormat(f) {
   };
 }
 
+// Short-lived cache for video metadata. /info and /formats both
+// call getInfo, and the extension usually calls one right after the
+// other for the same video — without a cache that is two full
+// yt-dlp runs (~5–15 s each) for the same video. Metadata barely
+// changes within minutes, so successful results are cached for
+// 10 minutes, keyed by video id (?t= or playlist params don't
+// matter). Failures are never cached. Bounded to 200 entries;
+// the oldest entry goes first.
+const INFO_CACHE_TTL_MS = 10 * 60 * 1000;
+const INFO_CACHE_MAX = 200;
+const infoCache = new Map();
+
+function videoIdFromUrl(url) {
+  try {
+    const u = new URL(String(url));
+    if (u.hostname === 'youtu.be') return u.pathname.split('/').filter(Boolean)[0] || null;
+    if (u.searchParams.get('v')) return u.searchParams.get('v');
+    const parts = u.pathname.split('/').filter(Boolean);
+    if ((parts[0] === 'shorts' || parts[0] === 'embed' || parts[0] === 'live' || parts[0] === 'v') && parts[1]) return parts[1];
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function getCachedInfo(url) {
+  const key = videoIdFromUrl(url) || String(url);
+  const entry = infoCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { infoCache.delete(key); return null; }
+  return entry.data;
+}
+
+function setCachedInfo(url, data) {
+  const key = videoIdFromUrl(url) || String(url);
+  if (infoCache.size >= INFO_CACHE_MAX) {
+    // Drop the oldest entry (Map keeps insertion order).
+    const oldest = infoCache.keys().next().value;
+    if (oldest !== undefined) infoCache.delete(oldest);
+  }
+  infoCache.set(key, { data, expiresAt: Date.now() + INFO_CACHE_TTL_MS });
+}
+
 // Full metadata for one video. Throws a friendly error on failure.
 // Storyboard pseudo-formats (sb0/sb1/sb2, mhtml) are dropped — they
 // are not downloadable video and would otherwise pollute the
 // resolutions list with 27p/45p/90p entries.
 async function getInfo(url) {
+  const cached = getCachedInfo(url);
+  if (cached) {
+    logger.info(`getInfo cache hit for ${videoIdFromUrl(url) || url}`);
+    return cached;
+  }
   const data = await runJson([...baseArgs(), '--dump-single-json', url], 90000);
   const formats = (data.formats || [])
     .filter(f => f.ext !== 'mhtml' && !String(f.format_id || '').startsWith('sb'))
     .map(mapFormat);
   const heights = [...new Set(formats.filter(f => f.height).map(f => f.height))].sort((a, b) => a - b);
-  return {
+  const result = {
     id: data.id || null,
     title: data.title || 'Untitled video',
     thumbnail: pickThumbnail(data.thumbnails),
@@ -170,6 +218,8 @@ async function getInfo(url) {
     audioOnly: formats.filter(f => f.kind === 'audio-only'),
     combined: formats.filter(f => f.kind === 'combined'),
   };
+  setCachedInfo(url, result);
+  return result;
 }
 
 // Only the formats that actually exist, grouped by height.
