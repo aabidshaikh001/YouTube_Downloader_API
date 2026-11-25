@@ -16,42 +16,65 @@ function baseArgs() {
   return args;
 }
 
-function processStartError(error) {
-  if (error.code !== 'ENOENT') return error;
-  const unavailable = new Error(
-    'yt-dlp executable was not found. Install yt-dlp and add it to PATH, or set YTDLP_PATH to its executable.'
-  );
-  unavailable.code = 'YTDLP_UNAVAILABLE';
-  return unavailable;
+// YouTube sometimes answers the default (web) player client with
+// "Sign in to confirm you're not a bot" for requests from datacenter
+// IPs (Render, a VPS, …) — even for ordinary public videos. The
+// Android player client usually gets through without a sign-in, but
+// it only sees the legacy formats (often just the 360p combined
+// format 18 on SABR-affected videos). So: try the web client first
+// (full quality), and retry once with the Android client when the
+// failure is a sign-in/bot error. Never the other way round —
+// leading with Android would cap every video at 360p.
+const ANDROID_ARGS = ['--extractor-args', 'youtube:player_client=android'];
+
+function isSignInError(err) {
+  return !!err && typeof err.message === 'string' && err.message.includes('sign-in');
+}
+
+// Insert extra args just before the URL (the last element).
+function withAndroidArgs(args) {
+  return [...args.slice(0, -1), ...ANDROID_ARGS, args[args.length - 1]];
 }
 
 function runJson(args, timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
-    const child = spawn(config.ytdlpPath, args, { shell: false, windowsHide: true });
-    let out = '';
-    let err = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error('yt-dlp timed out'));
-    }, timeoutMs);
-    child.stdout.on('data', d => { out += d; });
-    child.stderr.on('data', d => { err += d; });
-    child.on('error', e => {
-      clearTimeout(timer);
-      reject(processStartError(e));
-    });
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (code === 0) {
-        try {
-          resolve(JSON.parse(out));
-        } catch (e) {
-          reject(new Error('yt-dlp returned unreadable data'));
+    const attempt = (attemptArgs, triedAndroid) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return reject(new Error('yt-dlp timed out'));
+      const child = spawn(config.ytdlpPath, attemptArgs, { shell: false, windowsHide: true });
+      let out = '';
+      let err = '';
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error('yt-dlp timed out'));
+      }, remaining);
+      child.stdout.on('data', d => { out += d; });
+      child.stderr.on('data', d => { err += d; });
+      child.on('error', e => {
+        clearTimeout(timer);
+        reject(new Error(`yt-dlp is not available: ${e.message}`));
+      });
+      child.on('close', code => {
+        clearTimeout(timer);
+        if (code === 0) {
+          try {
+            resolve(JSON.parse(out));
+          } catch (e) {
+            reject(new Error('yt-dlp returned unreadable data'));
+          }
+          return;
         }
-      } else {
-        reject(new Error(friendlyError(err, code)));
-      }
-    });
+        const error = new Error(friendlyError(err, code));
+        if (!triedAndroid && isSignInError(error)) {
+          logger.info('yt-dlp hit a sign-in/bot check — retrying with the Android player client');
+          attempt(withAndroidArgs(attemptArgs), true);
+          return;
+        }
+        reject(error);
+      });
+    };
+    attempt(args, false);
   });
 }
 
@@ -84,7 +107,7 @@ async function getVersion() {
     let out = '';
     const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('yt-dlp --version timed out')); }, 15000);
     child.stdout.on('data', d => { out += d; });
-    child.on('error', e => { clearTimeout(timer); reject(processStartError(e)); });
+    child.on('error', e => { clearTimeout(timer); reject(e); });
     child.on('close', code => {
       clearTimeout(timer);
       if (code === 0) resolve(out.trim());
@@ -121,9 +144,14 @@ function mapFormat(f) {
 }
 
 // Full metadata for one video. Throws a friendly error on failure.
+// Storyboard pseudo-formats (sb0/sb1/sb2, mhtml) are dropped — they
+// are not downloadable video and would otherwise pollute the
+// resolutions list with 27p/45p/90p entries.
 async function getInfo(url) {
   const data = await runJson([...baseArgs(), '--dump-single-json', url], 90000);
-  const formats = (data.formats || []).map(mapFormat);
+  const formats = (data.formats || [])
+    .filter(f => f.ext !== 'mhtml' && !String(f.format_id || '').startsWith('sb'))
+    .map(mapFormat);
   const heights = [...new Set(formats.filter(f => f.height).map(f => f.height))].sort((a, b) => a - b);
   return {
     id: data.id || null,
@@ -217,10 +245,29 @@ function parseSpeed(text) {
 // Download one video (or audio) into jobDir. onProgress is called
 // with { progress, speed, eta, downloadedBytes, totalBytes }.
 // Returns the finished file path. Throws on failure. The caller
-// owns the child process handle (for cancellation) via onSpawn.
+// owns the child process handle (for cancellation) via onSpawn —
+// onSpawn is called again for the retry child, so the caller's
+// handle always points at the currently running process.
+// On a sign-in/bot failure, the download is retried once with the
+// Android player client (see the note above ANDROID_ARGS); partial
+// output files from the first attempt are removed first.
 function downloadMedia({ url, jobDir, kind, quality, format, onProgress, onSpawn, timeoutMs }) {
-  return new Promise((resolve, reject) => {
-    const args = [...baseArgs(), '--newline'];
+  const deadline = Date.now() + timeoutMs;
+
+  const cleanPartialOutputs = () => {
+    try {
+      for (const f of fs.readdirSync(jobDir)) {
+        if (f.startsWith('output.')) {
+          try { fs.unlinkSync(path.join(jobDir, f)); } catch (e) { /* already gone */ }
+        }
+      }
+    } catch (e) { /* dir may not exist yet */ }
+  };
+
+  const attempt = (extraArgs, triedAndroid) => new Promise((resolve, reject) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return reject(new Error(`Download timed out after ${Math.round(timeoutMs / 60000)} minutes.`));
+    const args = [...baseArgs(), ...extraArgs, '--newline'];
     const outputTemplate = path.join(jobDir, 'output.%(ext)s');
     if (kind === 'audio') {
       const audioFormat = format || 'mp3';
@@ -248,7 +295,7 @@ function downloadMedia({ url, jobDir, kind, quality, format, onProgress, onSpawn
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`Download timed out after ${Math.round(timeoutMs / 60000)} minutes.`));
-    }, timeoutMs);
+    }, remaining);
     timer.unref();
 
     child.stdout.on('data', d => {
@@ -273,7 +320,7 @@ function downloadMedia({ url, jobDir, kind, quality, format, onProgress, onSpawn
     });
     child.on('error', e => {
       clearTimeout(timer);
-      reject(processStartError(e));
+      reject(new Error(`yt-dlp is not available: ${e.message}`));
     });
     child.on('close', code => {
       clearTimeout(timer);
@@ -292,9 +339,18 @@ function downloadMedia({ url, jobDir, kind, quality, format, onProgress, onSpawn
           return reject(new Error(`Could not read the downloaded file: ${e.message}`));
         }
       }
-      reject(new Error(friendlyError(stderrTail || err, code)));
+      const error = new Error(friendlyError(stderrTail || err, code));
+      if (!triedAndroid && isSignInError(error)) {
+        logger.info('yt-dlp download hit a sign-in/bot check — retrying with the Android player client');
+        cleanPartialOutputs();
+        attempt(ANDROID_ARGS, true).then(resolve, reject);
+        return;
+      }
+      reject(error);
     });
   });
+
+  return attempt([], false);
 }
 
 module.exports = {
