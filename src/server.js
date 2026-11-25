@@ -5,9 +5,15 @@ const config = require('./config/config');
 const logger = require('./utils/logger');
 const app = require('./app');
 const jobService = require('./services/job.service');
+const healthService = require('./services/health.service');
 const { startCleanupLoop, removeDirQuiet } = require('./utils/fileCleanup');
 
 jobService.ensureBaseDir();
+
+// Background service probe (yt-dlp / ffmpeg / ffprobe versions) —
+// runs on a schedule, never inside a request, so /health answers
+// instantly. See services/health.service.js for why this matters.
+healthService.start();
 
 // Background cleanup: expire + remove old jobs and orphaned files.
 // The callback removes an expired job's whole temp directory.
